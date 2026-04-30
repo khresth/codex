@@ -1,5 +1,6 @@
 use rand::Rng;
 use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -244,12 +245,12 @@ async fn wait_for_late_network_denial(network_cancelled: Option<CancellationToke
     };
     if network_cancelled.is_cancelled() {
         return true;
-    }
+    };
 
-    tokio::select! {
+    return tokio::select! {
         _ = network_cancelled.cancelled() => true,
         _ = tokio::time::sleep(LATE_NETWORK_DENIAL_GRACE_PERIOD) => false,
-    }
+    };
 }
 
 async fn finish_deferred_network_approval_after_process_exit_for_session(
@@ -1212,33 +1213,44 @@ impl UnifiedExecProcessManager {
         None
     }
 
-    // Centralized pruning policy so we can easily swap strategies later.
     fn process_id_to_prune_from_meta(meta: &[(i32, Instant, bool)]) -> Option<i32> {
         if meta.is_empty() {
             return None;
         }
 
-        let mut by_recency = meta.to_vec();
-        by_recency.sort_by_key(|(_, last_used, _)| Reverse(*last_used));
-        let protected: HashSet<i32> = by_recency
-            .iter()
-            .take(8)
-            .map(|(process_id, _, _)| *process_id)
-            .collect();
+        let mut recent: BinaryHeap<Reverse<(Instant, i32)>> = BinaryHeap::with_capacity(9);
 
-        let mut lru = meta.to_vec();
-        lru.sort_by_key(|(_, last_used, _)| *last_used);
-
-        if let Some((process_id, _, _)) = lru
-            .iter()
-            .find(|(process_id, _, exited)| !protected.contains(process_id) && *exited)
-        {
-            return Some(*process_id);
+        for &(process_id, last_used, _) in meta {
+            if recent.len() < 8 {
+                recent.push(Reverse((last_used, process_id)));
+            } else if let Some(&Reverse((min_time, _))) = recent.peek() {
+                if last_used > min_time {
+                    recent.pop();
+                    recent.push(Reverse((last_used, process_id)));
+                }
+            }
         }
 
-        lru.into_iter()
-            .find(|(process_id, _, _)| !protected.contains(process_id))
-            .map(|(process_id, _, _)| process_id)
+        let protected: HashSet<i32> = recent.into_iter().map(|Reverse((_, pid))| pid).collect();
+
+        let mut best_exited: Option<(Instant, i32)> = None;
+        let mut best_any: Option<(Instant, i32)> = None;
+
+        for &(process_id, last_used, exited) in meta {
+            if protected.contains(&process_id) {
+                continue;
+            }
+
+            if best_any.map_or(true, |(t, _)| last_used < t) {
+                best_any = Some((last_used, process_id));
+            }
+
+            if exited && best_exited.map_or(true, |(t, _)| last_used < t) {
+                best_exited = Some((last_used, process_id));
+            }
+        }
+
+        best_exited.or(best_any).map(|(_, process_id)| process_id)
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
